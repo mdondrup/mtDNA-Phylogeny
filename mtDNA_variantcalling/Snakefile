@@ -240,6 +240,7 @@ rule consensus_fasta:
         cat {input.ref} | bcftools consensus {input.vcf} > {output.consensus_fa}
         """
 
+
 # Rule: Modify FASTA headers with sample name
 rule modify_fasta_headers:
     input:
