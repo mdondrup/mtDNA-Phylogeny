@@ -1,0 +1,283 @@
+import os
+import re
+import json
+
+# Config and Reference
+REFERENCE = "Path/to/reference/genome"
+FASTQ_DIR = "Path/to/fastq/files"
+
+# Function to get sample names by trimming suffixes from filenames
+def get_samples():
+    suffix1 = "_R1.fastq.gz"
+    suffix2 = "_R2.fastq.gz"
+    samples = list(set([re.sub(r'(_R1|_R2)\.fastq\.gz$', '', f) for f in os.listdir(FASTQ_DIR) if f.endswith(".fastq.gz")]))
+    if not samples:
+        raise FileNotFoundError("No FASTQ files found in the specified directory.")
+    return samples
+
+# Function to get the R1 and R2 fastq files for paired-end samples
+def get_illumina_fastqs(wildcards):
+    r1 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
+          if re.search('^' + wildcards.sample + ".*_R1\\.fastq\\.gz$", f)]
+    r2 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
+          if re.search('^' + wildcards.sample + ".*_R2\\.fastq\\.gz$", f)]
+
+    if r1 and r2:
+        return [r1[0], r2[0]]
+    else:
+        return []
+
+# Getting the samples
+SAMPLES = get_samples()
+print(SAMPLES)
+
+# Rule: Define the final output of the pipeline
+rule all:
+    input:
+        expand("fastp/{sample}_R1.trimmed.fastq.gz", sample=SAMPLES),
+        expand("fastp/{sample}_R2.trimmed.fastq.gz", sample=SAMPLES),
+        expand("fastp/{sample}.fastp_report.html", sample=SAMPLES),
+        expand("fastp/{sample}.fastp_report.json", sample=SAMPLES),
+        expand("aligned/{sample}.aligned.bam", sample=SAMPLES),
+        expand("aligned/{sample}.aligned.bam.bai", sample=SAMPLES),
+        expand("aligned/{sample}.filtered.bam", sample=SAMPLES),
+        expand("aligned/{sample}.filtered.bam.bai", sample=SAMPLES),
+        expand("aligned/{sample}.coverage.txt", sample=SAMPLES),
+        expand("aligned/{sample}.genome_coverage.txt", sample=SAMPLES),
+        "multiqc_report/multiqc_report.html",
+        expand("vcf/{sample}.vcf", sample=SAMPLES),
+        expand("filtered_vcf/{sample}.filtered.vcf", sample=SAMPLES),
+        expand("filtered_vcf/{sample}.filtered.vcf.gz.tbi", sample=SAMPLES),
+        expand("snps/{sample}.snp_summary.txt", sample=SAMPLES),
+        expand("consensus/{sample}.consensus.fa", sample=SAMPLES),
+        expand("consensus/{sample}.final_consensus.fa", sample=SAMPLES),
+        "iqtree/Samples.contree"
+
+
+# Rule: Setup (create directories)
+rule setup:
+    output: ".setup_done"
+    shell:
+        "mkdir -p fastp aligned fastq multiqc_report vcf filtered_vcf snps consensus iqtree  && touch .setup_done"
+
+# Rule: Adapter removal and quality trimming with fastp
+rule fastp_pe:
+    conda: "envs/fastp.yaml"
+    input:
+        lambda wildcards: get_illumina_fastqs(wildcards)
+    output:
+        r1="fastp/{sample}_R1.trimmed.fastq.gz",
+        r2="fastp/{sample}_R2.trimmed.fastq.gz",
+        html="fastp/{sample}.fastp_report.html",
+        json="fastp/{sample}.fastp_report.json"
+    threads: 16
+    shell:
+        """
+        fastp -w {threads} -i {input[0]} -I {input[1]} -o {output.r1} -O {output.r2} --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA --qualified_quality_phred 20 --length_required 30 --low_complexity_filter --disable_trim_poly_g --trim_front1 2 --trim_tail2 2 -j {output.json} -h {output.html}
+        """
+
+# Rule: BWA mapping (paired-end reads)
+rule bwa_aln:
+    conda: "envs/bwaaln.yaml"
+    input:
+        r1="fastp/{sample}_R1.trimmed.fastq.gz",
+        r2="fastp/{sample}_R2.trimmed.fastq.gz",
+        ref=REFERENCE
+    output:
+        bam="aligned/{sample}.aligned.bam",
+        bai="aligned/{sample}.aligned.bam.bai"
+    threads: 30
+    shell:
+        """
+        bwa aln -t {threads} {input.ref} {input.r1} > {wildcards.sample}_R1.sai
+        bwa aln -t {threads} {input.ref} {input.r2} > {wildcards.sample}_R2.sai
+
+        RGSTR="@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}"
+
+        bwa sampe -r "$RGSTR" {input.ref} {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai {input.r1} {input.r2} | \
+        samtools sort -@ {threads} -o {output.bam}
+
+        samtools index {output.bam}
+
+        rm {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai
+        """
+
+# Rule: Filter BAM by mapping quality (using samtools)
+rule samtools_filter:
+    conda: "envs/samtools.yaml"
+    input:
+        bam="aligned/{sample}.aligned.bam",
+        bai="aligned/{sample}.aligned.bam.bai"
+    output:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai"
+    threads: 16
+    shell:
+        """
+        samtools view -@ {threads} -bq 30 {input.bam} | samtools sort -@ {threads} -o {output.bam}
+        samtools index {output.bam}
+        """
+
+# Rule: Calculate coverage using samtools depth
+rule calculate_coverage:
+    conda: "envs/samtools.yaml"
+    input:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai"
+    output:
+        coverage="aligned/{sample}.coverage.txt"
+    shell:
+        """
+        samtools depth -aa {input.bam} > {output.coverage}
+        """
+
+# Rule: Calculate coverage using bedtools genomecov
+rule calculate_genome_coverage:
+    conda: "envs/bedtools.yaml"
+    input:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai",
+    output:
+        coverage="aligned/{sample}.genome_coverage.txt"
+    shell:
+        """
+        bedtools genomecov -ibam {input.bam} > {output.coverage}
+        """
+
+# Rule: Generate MultiQC report
+rule multiqc:
+    conda: "envs/multiqc.yaml"
+    input:
+        expand("fastp/{sample}.fastp_report.json", sample=SAMPLES),
+        expand("aligned/{sample}.aligned.bam", sample=SAMPLES),
+        expand("aligned/{sample}.filtered.bam", sample=SAMPLES),
+        expand("aligned/{sample}.coverage.txt", sample=SAMPLES),
+        expand("aligned/{sample}.genome_coverage.txt", sample=SAMPLES)
+    output:
+        "multiqc_report/multiqc_report.html"
+    shell:
+        """
+        multiqc -o multiqc_report .
+        """
+
+# Rule: Generate VCF files using bcftools
+rule bcftools_call:
+    conda: "envs/bcftools.yaml"
+    input:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai",
+        ref=REFERENCE
+    output:
+        vcf="vcf/{sample}.vcf"
+    threads: 8
+    shell:
+        """
+        bcftools mpileup -f {input.ref} -q 30 {input.bam} | \
+        bcftools call -mv --ploidy 1 -o {output.vcf}
+        """
+
+# Rule: Filter VCF files using vcftools
+rule vcftools_filter:
+    conda: "envs/vcftools.yaml"
+    input:
+        vcf="vcf/{sample}.vcf"
+    output:
+        filtered_vcf="filtered_vcf/{sample}.filtered.vcf"
+    threads: 4
+    shell:
+        """
+        vcftools --vcf {input.vcf} --remove-indels --recode --minDP 3 --out filtered_vcf/{wildcards.sample}.filtered
+        mv filtered_vcf/{wildcards.sample}.filtered.recode.vcf {output.filtered_vcf}
+        """
+
+# Rule: Compress and index filtered VCF files using bgzip and tabix
+rule bgzip_tabix:
+    conda: "envs/samtools.yaml"
+    input:
+        filtered_vcf="filtered_vcf/{sample}.filtered.vcf"
+    output:
+        filtered_vcf_gz="filtered_vcf/{sample}.filtered.vcf.gz",
+        tbi="filtered_vcf/{sample}.filtered.vcf.gz.tbi"
+    shell:
+        """
+        bgzip -c {input.filtered_vcf} > {output.filtered_vcf_gz}
+        tabix -p vcf {output.filtered_vcf_gz}
+        """
+
+rule snp_summary:
+    conda: "envs/bcftools.yaml"
+    input:
+        filtered_vcf_gz="filtered_vcf/{sample}.filtered.vcf.gz",
+        tbi="filtered_vcf/{sample}.filtered.vcf.gz.tbi"
+    output:
+        summary="snps/{sample}.snp_summary.txt"
+    shell:
+        """
+        # Check if the VCF file is empty or malformed
+        if [ $(bcftools view -H {input.filtered_vcf_gz} | wc -l) -eq 0 ]; then
+            echo "No SNPs found or the VCF file is empty for {wildcards.sample}" > {output.summary}
+        else
+            # Count each SNP type and write to summary file
+            bcftools query -f '%REF\t%ALT\n' {input.filtered_vcf_gz} | awk '{{print $1 ">" $2}}' | sort | uniq -c | awk '{{print $2, $1}}' > {output.summary}
+
+            # Calculate and append the total number of SNPs
+            TOTAL_SNPS=$(bcftools view -H -v snps {input.filtered_vcf_gz} | wc -l)
+            echo -e "Total SNPs\t$TOTAL_SNPS" >> {output.summary}
+        fi
+        """
+
+# Rule: Generate consensus FASTA files from VCF using bcftools
+rule consensus_fasta:
+    conda: "envs/bcftools.yaml"
+    input:
+        vcf="filtered_vcf/{sample}.filtered.vcf.gz",
+        ref=REFERENCE
+    output:
+        consensus_fa="consensus/{sample}.consensus.fa"
+    threads: 4
+    shell:
+        """
+        cat {input.ref} | bcftools consensus {input.vcf} > {output.consensus_fa}
+        """
+
+# Rule: Modify FASTA headers with sample name
+rule modify_fasta_headers:
+    input:
+        consensus_fa="consensus/{sample}.consensus.fa"
+    output:
+        final_consensus_fa="consensus/{sample}.final_consensus.fa"
+    shell:
+        """
+        SAMPLE_NAME=$(basename {input.consensus_fa} .consensus.fa)
+        # Remove the trailing dot from SAMPLE_NAME, if any
+        SAMPLE_NAME=${{SAMPLE_NAME%.}}
+        # Replace the current header with >SAMPLE_NAME
+        sed '1s/.*/>'"$SAMPLE_NAME"'/' {input.consensus_fa} > {output.final_consensus_fa}
+        """
+
+# Rule: Concatenate all final consensus FASTA files into a single file
+rule concatenate_fasta:
+    conda: "envs/samtools.yaml"
+    input:
+        expand("consensus/{sample}.final_consensus.fa", sample=SAMPLES)  # Ensure all final consensus files are included
+    output:
+        "Samples.fa"
+    shell:
+        """
+        cat {input} > {output}
+        """
+
+
+# Rule: Perform phylogenetic tree inference with IQ-TREE
+rule iqtree:
+    conda: "envs/iqtree.yaml"
+    input:
+        "Samples.fa"
+    output:
+        "iqtree/Samples.contree"  
+    shell:
+        """
+        mkdir -p {output}/..  # Ensure the iqtree directory exists
+        iqtree2 -s {input} -m GTR -bb 1000 -nt AUTO -pre iqtree/Samples 
+        """
+

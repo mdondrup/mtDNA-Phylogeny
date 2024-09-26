@@ -1,0 +1,203 @@
+import os
+import re
+
+# Config and Reference
+REFERENCE = "Path/to/reference/genome"
+FASTQ_DIR = "Path/to/fastq/files"
+NASP_CONFIG = "Path/to/config.xml"
+
+# Function to get sample names by trimming suffixes from filenames
+def get_samples():
+    suffix1 = "_R1.fastq.gz"
+    suffix2 = "_R2.fastq.gz"
+    samples = list(set([re.sub(r'(_R1|_R2)\.fastq\.gz$', '', f) for f in os.listdir(FASTQ_DIR) if f.endswith(".fastq.gz")]))
+    if not samples:
+        raise FileNotFoundError("No FASTQ files found in the specified directory.")
+    return samples
+
+# Function to get the R1 and R2 fastq files for paired-end samples
+def get_illumina_fastqs(wildcards):
+    r1 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
+          if re.search('^' + wildcards.sample + ".*_R1\\.fastq\\.gz$", f)]
+    r2 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
+          if re.search('^' + wildcards.sample + ".*_R2\\.fastq\\.gz$", f)]
+
+    if r1 and r2:
+        return [r1[0], r2[0]]
+    else:
+        return []
+
+# Getting the samples
+SAMPLES = get_samples()
+print(SAMPLES)
+
+# Rule: Define the final output of the pipeline
+rule all:
+    input:
+        expand("nasp/matrices/bestsnp.fasta"),
+        expand("nasp/matrix_dto.xml"),
+        expand("nasp/reference/duplicates.txt"),
+        expand("nasp/{sample}_contigs.fasta", sample=SAMPLES),
+        expand("fastp/{sample}_R1.trimmed.fastq.gz", sample=SAMPLES),
+        expand("fastp/{sample}_R2.trimmed.fastq.gz", sample=SAMPLES),
+        expand("fastp/{sample}.fastp_report.html", sample=SAMPLES),
+        expand("fastp/{sample}.fastp_report.json", sample=SAMPLES),
+        expand("aligned/{sample}.aligned.bam", sample=SAMPLES),
+        expand("aligned/{sample}.aligned.bam.bai", sample=SAMPLES),
+        expand("aligned/{sample}.filtered.bam", sample=SAMPLES),
+        expand("aligned/{sample}.filtered.bam.bai", sample=SAMPLES),
+        expand("fastq/{sample}_processed_R1.fastq.gz", sample=SAMPLES),
+        expand("fastq/{sample}_processed_R2.fastq.gz", sample=SAMPLES),
+        expand("spades/{sample}_spades/contigs.fasta", sample=SAMPLES),
+        expand("quast/{sample}_quast/icarus.html", sample=SAMPLES),
+
+# Rule ordering
+ruleorder: run_nasp > run_nasp_matrix
+
+# Rule: Setup (create directories)
+rule setup:
+    output: ".setup_done"
+    shell:
+        "mkdir -p fastp aligned fastq spades quast nasp && touch .setup_done"
+
+# Rule: Adapter removal and quality trimming with fastp
+rule fastp_pe:
+    conda: "envs/fastp.yaml"
+    input:
+        lambda wildcards: get_illumina_fastqs(wildcards)
+    output:
+        r1="fastp/{sample}_R1.trimmed.fastq.gz",
+        r2="fastp/{sample}_R2.trimmed.fastq.gz",
+        html="fastp/{sample}.fastp_report.html",
+        json="fastp/{sample}.fastp_report.json"
+    threads: 16
+    shell:
+        """
+        fastp -w {threads} -i {input[0]} -I {input[1]} -o {output.r1} -O {output.r2} --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA --qualified_quality_phred 20 --length_required 30 --low_complexity_filter --disable_trim_poly_g --trim_front1 2 --trim_tail2 2 -j {output.json} -h {output.html}
+        """
+
+# Rule: BWA mapping (paired-end reads)
+rule bwa_aln:
+    conda: "envs/bwaaln.yaml"
+    input:
+        r1="fastp/{sample}_R1.trimmed.fastq.gz",
+        r2="fastp/{sample}_R2.trimmed.fastq.gz",
+        ref=REFERENCE
+    output:
+        bam="aligned/{sample}.aligned.bam",
+        bai="aligned/{sample}.aligned.bam.bai"
+    threads: 30
+    shell:
+        """
+        bwa aln -t {threads} {input.ref} {input.r1} > {wildcards.sample}_R1.sai
+        bwa aln -t {threads} {input.ref} {input.r2} > {wildcards.sample}_R2.sai
+
+        RGSTR="@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}"
+
+        bwa sampe -r "$RGSTR" {input.ref} {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai {input.r1} {input.r2} | \
+        samtools sort -@ {threads} -o {output.bam}
+
+        samtools index {output.bam}
+
+        rm {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai
+        """
+
+# Rule: Filter BAM by mapping quality (using samtools)
+rule samtools_filter:
+    conda: "envs/samtools.yaml"
+    input:
+        bam="aligned/{sample}.aligned.bam",
+        bai="aligned/{sample}.aligned.bam.bai"
+    output:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai"
+    threads: 16
+    shell:
+        """
+        samtools view -@ {threads} -bq 30 {input.bam} | samtools sort -@ {threads} -o {output.bam}
+        samtools index {output.bam}
+        """
+
+# Rule: Convert filtered BAM to paired-end FASTQ files
+rule bam_to_fastq:
+    conda: "envs/samtools.yaml"
+    input:
+        bam="aligned/{sample}.filtered.bam",
+        bai="aligned/{sample}.filtered.bam.bai"
+    output:
+        r1="fastq/{sample}_processed_R1.fastq.gz",
+        r2="fastq/{sample}_processed_R2.fastq.gz"
+    threads: 16
+    shell:
+        """
+        samtools collate -u -O {input.bam} | samtools fastq -@ {threads} -1 {output.r1} -2 {output.r2} -0 /dev/null -s /dev/null -n -
+        """
+
+# Rule: SPAdes assembly using paired-end FASTQ files
+rule spades:
+    conda: "envs/spades.yaml"
+    input:
+        r1="fastq/{sample}_processed_R1.fastq.gz",
+        r2="fastq/{sample}_processed_R2.fastq.gz"
+    output:
+        "spades/{sample}_spades/contigs.fasta"
+    threads: 40
+    shell:
+        """
+        spades.py --isolate -t {threads} -1 {input.r1} -2 {input.r2} -o spades/{wildcards.sample}_spades/
+        """
+
+# Rule: Copy contigs.fasta from spades to QUAST
+rule quast:
+    conda: "envs/quast.yaml"
+    input:
+        "spades/{sample}_spades/contigs.fasta"
+    output:
+        "quast/{sample}_quast/icarus.html"
+    threads: 8
+    shell:
+        """
+        quast {input} -r {REFERENCE} --min-contig 250 --fungus -o quast/{wildcards.sample}_quast/
+        """
+
+# Rule: Copy SPAdes contigs to NASP directory and rename
+rule copy_contigs_to_nasp:
+    input:
+        "spades/{sample}_spades/contigs.fasta"
+    output:
+        "nasp/{sample}_contigs.fasta"
+    shell:
+        """
+        mkdir -p nasp
+        cp {input} nasp/
+        mv nasp/contigs.fasta nasp/{wildcards.sample}_contigs.fasta
+        """
+
+# Rule: Run NASP pipeline
+rule run_nasp:
+    conda: "envs/nasp.yaml"
+    input:
+        ref=REFERENCE,
+        config=NASP_CONFIG,
+    output:
+        "nasp/matrix_dto.xml"
+	"nasp/reference/duplicates.txt"
+    shell:
+        """
+        nasp --config {input.config} {input.ref} nasp/
+        """
+
+# Rule: Run NASP pipeline for matrix
+rule run_nasp_matrix:
+    conda: "envs/nasp.yaml"
+    input:
+        ref=REFERENCE,
+        matrix="nasp/matrix_dto.xml",
+        dup="nasp/reference/duplicates.txt"
+    output:
+        "nasp/matrices/bestsnp.fasta"
+    shell:
+        """
+        nasp matrix --dto-file {input.matrix} --reference-fasta {input.ref} --reference-dups {input.dup} --matrix-folder nasp/matrices/
+        """
+
