@@ -2,15 +2,15 @@
 <NaspInputData>
     <Options>
         <RunName>nasp</RunName>
-        <OutputFolder>/export/elixiruibfs/Elixir_Dolan/HistoricalKveik_Oya/snakemake_test/Snakemake_testsamples/nasp</OutputFolder>
-        <Reference name="NC_001224.1" path="/export/elixiruibfs/Elixir_Dolan/HistoricalKveik_Oya/reference/NC_001224.1.fna">
+        <OutputFolder>/Path/to/output/folder</OutputFolder>
+        <Reference name="reference/genome/name" path="Path/to/reference/genome">
             <FindDups>True</FindDups>
         </Reference>
         <Filters/>
         <JobSubmitter>NONE</JobSubmitter>
     </Options>
     <Files>
-        <AssemblyFolder path="/export/elixiruibfs/Elixir_Dolan/HistoricalKveik_Oya/snakemake_test/Snakemake_testsamples/nasp">
+        <AssemblyFolder path="Path/to/assembly/folder">
             <Assembly sample="HFBUMD_contigs">HFBUMD_contigs.fasta</Assembly>
         </AssemblyFolder>
     </Files>
