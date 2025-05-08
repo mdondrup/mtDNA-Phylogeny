@@ -3,32 +3,60 @@ import re
 import json
 
 # Config and Reference
-REFERENCE = "Path/to/reference/genome"
-FASTQ_DIR = "Path/to/fastq/files"
+# To only include mtDNA, 
+REFERENCE = "/export/elixiruibfs/Elixir_Dolan/Kveik_Yeast_2022/reference-genome/NC_001224.fna"
+FASTQ_DIR = "/export/elixiruibfs/Elixir_Dolan/Kveik_Yeast_2023/Fastqs"
+
+
+onsuccess:
+    print("Workflow finished, no error")
+    shell("send_message.py 'mtPhylo pipeline finished, no error'")
+
+onerror:
+    print("An error occurred, see the log")
+    shell("send_message.py 'An error occured in the mtPhylo pipeline, see the log: {log}'")
+    
+onstart:
+    print ("----------------------------------------------------------------------------")
+    print ("Starting mtPhylo analysis pipeline")
+    print ("----------------------------------------------------------------------------")
+    shell('send_message.py "mtPhylo pipeline started at $(date)"')
+
+
+
 
 # Function to get sample names by trimming suffixes from filenames
+## automatically retrieves all the samples
+
 def get_samples():
-    suffix1 = "_R1.fastq.gz"
-    suffix2 = "_R2.fastq.gz"
-    samples = list(set([re.sub(r'(_R1|_R2)\.fastq\.gz$', '', f) for f in os.listdir(FASTQ_DIR) if f.endswith(".fastq.gz")]))
-    if not samples:
-        raise FileNotFoundError("No FASTQ files found in the specified directory.")
-    return samples
+    fastqdir = FASTQ_DIR
+    suffix1 = "_R1_001.fastq.gz"
+    suffix2 = "_R1_merged_001.fastq.gz"
+    suffix3 = "_1.fastq"
+    return [f.replace(suffix1, "").replace(suffix2, '').replace(suffix3, '') 
+	for f in os.listdir(fastqdir) if f.endswith(suffix1) or f.endswith(suffix2) or f.endswith(suffix3)]
+    
+SAMPLES = get_samples()
+#print (SAMPLES)
+
+print("Found "+ str(len(SAMPLES)) +" samples.")
 
 # Function to get the R1 and R2 fastq files for paired-end samples
 def get_illumina_fastqs(wildcards):
-    r1 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
-          if re.search('^' + wildcards.sample + ".*_R1\\.fastq\\.gz$", f)]
-    r2 = [os.path.join(FASTQ_DIR, f) for f in os.listdir(FASTQ_DIR)
-          if re.search('^' + wildcards.sample + ".*_R2\\.fastq\\.gz$", f)]
+    fastq_dir = FASTQ_DIR
+    r1 = [os.path.join(fastq_dir, f) for f in os.listdir(fastq_dir) 
+		if (re.search('^' + wildcards.sample + ".*R1_.*001\\.fastq\\.gz$", f) or re.search('^' + wildcards.sample + ".*_1\\.fastq$", f) )]
+    r2 = [os.path.join(fastq_dir, f) for f in os.listdir(fastq_dir)
+                if (re.search('^' + wildcards.sample + ".*R2_.*001\\.fastq\\.gz$", f) or re.search('^' + wildcards.sample + ".*_2\\.fastq$", f) )]
+    #print("Sample: " + wildcards.sample)
+    #print('  - R1: ' + r1[0] + ' R2:' + r2[0] )
 
-    if r1 and r2:
-        return [r1[0], r2[0]]
-    else:
-        return []
+    return ([r1[0], r2[0]])
+#
 
 # Getting the samples
 SAMPLES = get_samples()
+print('Found the following samples')
 print(SAMPLES)
 
 # Rule: Define the final output of the pipeline
@@ -51,7 +79,7 @@ rule all:
         expand("snps/{sample}.snp_summary.txt", sample=SAMPLES),
         expand("consensus/{sample}.consensus.fa", sample=SAMPLES),
         expand("consensus/{sample}.final_consensus.fa", sample=SAMPLES),
-        "iqtree/Samples.contree"
+        "iqtree/Samples-GTR.contree", "iqtree/Samples-GTRI.contree", "iqtree/Samples-MFP.contree", 
 
 
 # Rule: Setup (create directories)
@@ -73,8 +101,22 @@ rule fastp_pe:
     threads: 16
     shell:
         """
-        fastp -w {threads} -i {input[0]} -I {input[1]} -o {output.r1} -O {output.r2} --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA --qualified_quality_phred 20 --length_required 30 --low_complexity_filter --disable_trim_poly_g --trim_front1 2 --trim_tail2 2 -j {output.json} -h {output.html}
+        fastp -w {threads} -i {input[0]} -I {input[1]} -o {output.r1} -O {output.r2} \
+           --qualified_quality_phred 20 --length_required 30 --low_complexity_filter -j {output.json} -h {output.html}
         """
+# Index the reference:
+rule bwa_index:
+    input:
+        REFERENCE,
+    output:
+        idx=multiext(REFERENCE, ".amb", ".ann", ".bwt", ".pac", ".sa"),
+    log:
+        "logs/bwa_index.log"
+    
+    wrapper:
+        "v5.5.2/bio/bwa/index"
+
+
 
 # Rule: BWA mapping (paired-end reads)
 rule bwa_aln:
@@ -82,22 +124,24 @@ rule bwa_aln:
     input:
         r1="fastp/{sample}_R1.trimmed.fastq.gz",
         r2="fastp/{sample}_R2.trimmed.fastq.gz",
-        ref=REFERENCE
+        ref=REFERENCE,
+        idx=multiext(REFERENCE, ".amb", ".ann", ".bwt", ".pac", ".sa")
     output:
         bam="aligned/{sample}.aligned.bam",
         bai="aligned/{sample}.aligned.bam.bai"
-    threads: 30
+    log: "logs/{sample}.bwa_aln.log"    
+    threads: 8
     shell:
         """
-        bwa aln -t {threads} {input.ref} {input.r1} > {wildcards.sample}_R1.sai
-        bwa aln -t {threads} {input.ref} {input.r2} > {wildcards.sample}_R2.sai
+        bwa aln -t {threads} {input.ref} {input.r1} > {wildcards.sample}_R1.sai 2> {log}
+        bwa aln -t {threads} {input.ref} {input.r2} > {wildcards.sample}_R2.sai 2>> {log}
 
         RGSTR="@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}"
 
         bwa sampe -r "$RGSTR" {input.ref} {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai {input.r1} {input.r2} | \
-        samtools sort -@ {threads} -o {output.bam}
+        samtools sort -@ {threads} -o {output.bam} 2>&1 >>{log}
 
-        samtools index {output.bam}
+        samtools index {output.bam} 2>&1 >>{log}
 
         rm {wildcards.sample}_R1.sai {wildcards.sample}_R2.sai
         """
@@ -270,15 +314,42 @@ rule concatenate_fasta:
 
 
 # Rule: Perform phylogenetic tree inference with IQ-TREE
-rule iqtree:
+rule iqtree_GTR:
     conda: "envs/iqtree.yaml"
     input:
         "Samples.fa"
     output:
-        "iqtree/Samples.contree"  
+        "iqtree/Samples-GTR.contree"  
+    log: "logs/iqtree-GTR.log"
     shell:
         """
-        mkdir -p {output}/..  # Ensure the iqtree directory exists
-        iqtree2 -s {input} -m GTR -bb 1000 -nt AUTO -pre iqtree/Samples 
+        mkdir -p $(dirname {output})  # Ensure the iqtree directory exists
+        iqtree2 -s {input} -m GTR -bb 1000 -nt AUTO -pre iqtree/Samples-GTR > {log} 2>&1
         """
 
+# Rule: Perform phylogenetic tree inference with IQ-TREE
+rule iqtree_GTRI:
+    conda: "envs/iqtree.yaml"
+    input:
+        "Samples.fa"
+    output:
+        "iqtree/Samples-GTRI.contree"  
+    log: "logs/iqtree-GTRI.log"
+    shell:
+        """
+        mkdir -p $(dirname {output})  # Ensure the iqtree directory exists
+        iqtree2 -s {input} -m GTR+I -bb 1000 -nt AUTO -pre iqtree/Samples-GTRI > {log} 2>&1
+        """
+
+rule iqtree_MFP:
+    conda: "envs/iqtree.yaml"
+    input:
+        "Samples.fa"
+    output:
+        "iqtree/Samples-MFP.contree"  
+    log: "logs/iqtree-MFP.log"
+    shell:
+        """
+        mkdir -p $(dirname {output})  # Ensure the iqtree directory exists
+        iqtree2 -s {input} -m MFP -bb 1000 -nt AUTO -pre iqtree/Samples-MFP > {log} 2>&1
+        """
